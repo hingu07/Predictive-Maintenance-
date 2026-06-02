@@ -1,0 +1,1394 @@
+/*
+ ╔══════════════════════════════════════════════════════════╗
+ ║   MACHINE HEALTH MONITOR  –  Arduino Nano Edition        ║
+ ║   Sensors: MPU6050 · ACS712 · DHT11 · KY-037            ║
+ ║   Fixes: non-blocking, 115200 baud, stable current read  ║
+ ╚══════════════════════════════════════════════════════════╝
+*/
+
+#include <Wire.h>
+#include <MPU6050.h>
+#include <DHT.h>
+
+// ── Sensor Objects ────────────────────────────────────────
+MPU6050 mpu;
+#define DHTPIN    3
+#define DHTTYPE   DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ── Pin Definitions ───────────────────────────────────────
+#define CURRENT_PIN  A1
+#define SOUND_PIN    A0
+#define BUZZ_CURRENT 6
+#define BUZZ_SOUND   5
+#define BUZZ_VIBE    7
+#define BUZZ_TEMP    4
+
+// ── Default Thresholds (can be updated via Serial commands) ─
+float CURRENT_THRESHOLD   = 1.00;   // Amps
+int   SOUND_THRESHOLD     = 15;     // Peak-to-peak ADC counts
+float VIBRATION_THRESHOLD = 0.08;   // g
+float TEMP_THRESHOLD      = 33.0;   // °C
+
+// ── ACS712 Constants ──────────────────────────────────────
+const float SENSITIVITY   = 0.185;  // V/A for ACS712-5A
+// Dynamic zero-offset calibration (measured at startup)
+int ZERO_OFFSET = 512;
+
+// ── MPU6050 Baseline ─────────────────────────────────────
+long  baseAx = 0, baseAy = 0, baseAz = 0;
+bool  calibrated = false;
+
+// ── Vibration Rolling Average ─────────────────────────────
+#define VIBE_HISTORY  10
+float vibeHistory[VIBE_HISTORY];
+int   vibeIdx        = 0;
+float vibeRollingAvg = 0.0;
+
+// ── DHT ───────────────────────────────────────────────────
+float lastTemp  = 0.0;
+float lastHumid = 0.0;
+unsigned long lastDHTRead = 0;
+
+// ── Non-blocking Timers ───────────────────────────────────
+unsigned long tCurrentStart  = 0;
+unsigned long tSoundStart    = 0;
+unsigned long tVibeStart     = 0;
+
+// Current RMS accumulators
+long  currSumSq = 0;
+int   currN     = 0;
+float currentA  = 0.0;
+bool  currAlert = false;
+
+// Sound peak-to-peak accumulators
+int   sndMax = 0, sndMin = 1023;
+int   volumeLevel = 0;
+bool  soundAlert  = false;
+
+// Vibration RMS accumulators
+long long vibeSumSq = 0;
+int       vibeN     = 0;
+bool      vibeAlert = false;
+
+// ── Output Timer ─────────────────────────────────────────
+unsigned long lastOutput = 0;
+
+// ── Serial Command Buffer ─────────────────────────────────
+String cmdBuffer = "";
+
+// ============================================================
+// Calibrate ACS712 zero-offset (machine idle, no load)
+// ============================================================
+void calibrateCurrentSensor() {
+  long sum = 0;
+  for (int i = 0; i < 100; i++) {
+    sum += analogRead(CURRENT_PIN);
+    delayMicroseconds(200);
+  }
+  ZERO_OFFSET = sum / 100;
+}
+
+// ============================================================
+// Calibrate MPU6050 static gravity baseline
+// Uses minimal delay — just microsecond waits between reads
+// ============================================================
+void calibrateMPU() {
+  long sumX = 0, sumY = 0, sumZ = 0;
+  const int SAMPLES = 200;
+  for (int i = 0; i < SAMPLES; i++) {
+    int16_t ax, ay, az;
+    mpu.getAcceleration(&ax, &ay, &az);
+    sumX += ax; sumY += ay; sumZ += az;
+    delayMicroseconds(500);  // ~0.5ms each = ~100ms total (was 2000ms!)
+  }
+  baseAx = sumX / SAMPLES;
+  baseAy = sumY / SAMPLES;
+  baseAz = sumZ / SAMPLES;
+  calibrated = true;
+}
+
+// ============================================================
+// Parse threshold-update commands from Python
+// Format:  SET_TEMP:33.5   SET_AMP:1.5   SET_VIBE:0.10   SET_SND:20
+// ============================================================
+void parseCommand(String cmd) {
+  cmd.trim();
+  if (cmd.startsWith("SET_TEMP:")) {
+    TEMP_THRESHOLD = cmd.substring(9).toFloat();
+  } else if (cmd.startsWith("SET_AMP:")) {
+    CURRENT_THRESHOLD = cmd.substring(8).toFloat();
+  } else if (cmd.startsWith("SET_VIBE:")) {
+    VIBRATION_THRESHOLD = cmd.substring(9).toFloat();
+  } else if (cmd.startsWith("SET_SND:")) {
+    SOUND_THRESHOLD = cmd.substring(8).toInt();
+  } else if (cmd == "RECAL") {
+    calibrateMPU();
+    calibrateCurrentSensor();
+    Serial.println("RECAL_DONE");
+  }
+}
+
+// ============================================================
+void setup() {
+  Serial.begin(115200);   // ← 115200 baud — much faster, less lag
+  Wire.begin();
+  Wire.setClock(400000);  // 400 kHz I²C (was default 100 kHz) — faster MPU reads
+
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("ERR:MPU6050");
+    while (1);
+  }
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);  // ±2g → 16384 LSB/g
+  mpu.setDLPFMode(MPU6050_DLPF_BW_98);
+
+  dht.begin();
+
+  pinMode(BUZZ_CURRENT, OUTPUT);
+  pinMode(BUZZ_SOUND,   OUTPUT);
+  pinMode(BUZZ_VIBE,    OUTPUT);
+  pinMode(BUZZ_TEMP,    OUTPUT);
+
+  for (int i = 0; i < VIBE_HISTORY; i++) vibeHistory[i] = 0;
+
+  // Force a DHT read immediately so we don't wait 2s for first data
+  lastDHTRead = millis() - 2000;
+
+  calibrateCurrentSensor();
+  calibrateMPU();
+
+  // Tell Python we're ready + current thresholds
+  Serial.println("READY");
+  Serial.print("THRESH:");
+  Serial.print(TEMP_THRESHOLD, 1); Serial.print(",");
+  Serial.print(CURRENT_THRESHOLD, 2); Serial.print(",");
+  Serial.print(VIBRATION_THRESHOLD, 4); Serial.print(",");
+  Serial.println(SOUND_THRESHOLD);
+  Serial.println("FORMAT:TEMP,HUMID,VIBE,AMP,SOUND,VA,CA,SA,TA");
+}
+
+// ============================================================
+void loop() {
+
+  // ── Read incoming Serial commands (non-blocking) ──────
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      if (cmdBuffer.length() > 0) {
+        parseCommand(cmdBuffer);
+        cmdBuffer = "";
+      }
+    } else {
+      cmdBuffer += c;
+    }
+  }
+
+  unsigned long now = millis();
+
+  // ══ 1. CURRENT — sample continuously, compute every 50ms ══
+  {
+    int raw = analogRead(CURRENT_PIN);
+    long c  = (long)raw - ZERO_OFFSET;
+    currSumSq += c * c;
+    currN++;
+    if (now - tCurrentStart >= 50) {
+      if (currN > 0) {
+        float rmsRaw = sqrt((float)currSumSq / currN);
+        currentA = (rmsRaw * 5.0 / 1024.0) / SENSITIVITY;
+        if (currentA < 0.03) currentA = 0.00;  // dead-band noise floor
+        currAlert = (currentA >= CURRENT_THRESHOLD);
+        digitalWrite(BUZZ_CURRENT, currAlert ? HIGH : LOW);
+      }
+      currSumSq     = 0;
+      currN         = 0;
+      tCurrentStart = now;
+    }
+  }
+
+  // ══ 2. SOUND — sample continuously, compute every 50ms ══
+  {
+    int v = analogRead(SOUND_PIN);
+    if (v > sndMax) sndMax = v;
+    if (v < sndMin) sndMin = v;
+    if (now - tSoundStart >= 50) {
+      volumeLevel = sndMax - sndMin;
+      soundAlert  = (volumeLevel >= SOUND_THRESHOLD);
+      digitalWrite(BUZZ_SOUND, soundAlert ? HIGH : LOW);
+      sndMax = 0; sndMin = 1023;
+      tSoundStart = now;
+    }
+  }
+
+  // ══ 3. VIBRATION — sample continuously, compute every 100ms ══
+  {
+    if (calibrated) {
+      int16_t ax, ay, az;
+      mpu.getAcceleration(&ax, &ay, &az);
+      long dx = (long)ax - baseAx;
+      long dy = (long)ay - baseAy;
+      long dz = (long)az - baseAz;
+      vibeSumSq += ((long long)dx*dx + (long long)dy*dy + (long long)dz*dz) / 16384LL;
+      vibeN++;
+    }
+    if (now - tVibeStart >= 100) {
+      if (vibeN > 0) {
+        float vibeRMS = sqrt((float)vibeSumSq / vibeN) / 128.0;
+        // Rolling average
+        vibeRollingAvg -= vibeHistory[vibeIdx] / (float)VIBE_HISTORY;
+        vibeHistory[vibeIdx] = vibeRMS;
+        vibeRollingAvg += vibeRMS / (float)VIBE_HISTORY;
+        vibeIdx = (vibeIdx + 1) % VIBE_HISTORY;
+        vibeAlert = (vibeRollingAvg >= VIBRATION_THRESHOLD);
+        digitalWrite(BUZZ_VIBE, vibeAlert ? HIGH : LOW);
+      }
+      vibeSumSq = 0;
+      vibeN     = 0;
+      tVibeStart = now;
+    }
+  }
+
+  // ══ 4. DHT11 — read every 2s (sensor limit) ══
+  if (now - lastDHTRead >= 2000) {
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    lastDHTRead = now;
+    if (!isnan(t) && !isnan(h)) {
+      lastTemp  = t;
+      lastHumid = h;
+    }
+    bool tempAlert = (lastTemp >= TEMP_THRESHOLD);
+    digitalWrite(BUZZ_TEMP, tempAlert ? HIGH : LOW);
+  }
+
+  // ══ 5. Output CSV every 500ms ══
+  // Sending at 2Hz gives Python smooth updates without flooding serial
+  if (now - lastOutput >= 500) {
+    lastOutput = now;
+    bool tempAlert = (lastTemp >= TEMP_THRESHOLD);
+
+    Serial.print(lastTemp, 1);        Serial.print(",");
+    Serial.print(lastHumid, 1);       Serial.print(",");
+    Serial.print(vibeRollingAvg, 4);  Serial.print(",");
+    Serial.print(currentA, 3);        Serial.print(",");
+    Serial.print(volumeLevel);        Serial.print(",");
+    Serial.print(vibeAlert  ? 1 : 0); Serial.print(",");
+    Serial.print(currAlert  ? 1 : 0); Serial.print(",");
+    Serial.print(soundAlert ? 1 : 0); Serial.print(",");
+    Serial.println(tempAlert  ? 1 : 0);
+  }
+}
+"""
+╔═══════════════════════════════════════════════════════════════════╗
+║   MACHINE HEALTH MONITOR  v3.0  –  Pro Industrial Edition        ║
+║   Arduino Nano + MPU6050 + ACS712 + DHT11 + KY-037              ║
+║                                                                   ║
+║   NEW in v3.0:                                                    ║
+║   • Critical system status banner (top)                          ║
+║   • Explainable health score with per-sensor breakdown           ║
+║   • Tabbed chart view (Overview/Temp/Vibration/Electrical/Noise) ║
+║   • Interactive hover tooltips + crosshair on all charts         ║
+║   • Smart alert panel (severity + cause + action + timestamp)    ║
+║   • Event timeline with clickable markers                        ║
+║   • Correlation / insight engine                                 ║
+║   • Dark / Light mode toggle                                     ║
+║   • Quick actions (export CSV, recalibrate, clear log)           ║
+║   • Threshold proximity warning dots                             ║
+╚═══════════════════════════════════════════════════════════════════╝
+
+pip install pyserial numpy scipy
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import serial
+import serial.tools.list_ports
+import threading
+import time
+import numpy as np
+from collections import deque
+from scipy.stats import linregress
+import datetime
+import csv
+import os
+import math
+import shutil
+
+# ── Config ────────────────────────────────────────────────────────
+BAUD_RATE    = 115200
+HISTORY_LEN  = 240
+ALERT_DECAY  = 8
+TREND_WINDOW = 40
+LOG_FILE     = "machine_health_log.csv"
+
+HEALTH_WEIGHTS = {"temp": 0.30, "vibe": 0.30, "amp": 0.25, "sound": 0.15}
+THRESHOLDS     = {"temp": 33.0, "vibe": 0.08, "amp": 1.00, "sound": 15}
+
+# ── Theme system ──────────────────────────────────────────────────
+DARK = {
+    "BG": "#080C10", "PANEL": "#0D1117", "PANEL2": "#111820",
+    "BORDER": "#1C2C3A", "BORDER2": "#243040", "DIM": "#1A2C3A",
+    "TEXT": "#D8E8F0", "SUBTEXT": "#4A6070",
+    "CYAN": "#00FFD1", "ORANGE": "#FF7040", "YELLOW": "#FFE040",
+    "PURPLE": "#BF87FF", "GREEN": "#39FF7A", "RED": "#FF2D55",
+    "BLUE": "#4DA6FF", "GRID": "#141F2A",
+}
+LIGHT = {
+    "BG": "#F0F4F8", "PANEL": "#FFFFFF", "PANEL2": "#E8EEF4",
+    "BORDER": "#CBD5E0", "BORDER2": "#A0AEC0", "DIM": "#E2E8F0",
+    "TEXT": "#1A202C", "SUBTEXT": "#718096",
+    "CYAN": "#0099AA", "ORANGE": "#D05020", "YELLOW": "#B07800",
+    "PURPLE": "#6B46C1", "GREEN": "#1A7F3C", "RED": "#C0152A",
+    "BLUE": "#2B6CB0", "GRID": "#E2E8F0",
+}
+
+T = dict(DARK)
+
+def apply_theme(d):
+    global T
+    T.update(d)
+
+# ── Alert catalogue ───────────────────────────────────────────────
+ALERT_INFO = {
+    "amp": {
+        "label": "OVERCURRENT",
+        "causes": ["Motor overload", "Short circuit", "Bearing seizure", "High mechanical load"],
+        "actions": ["Reduce load immediately", "Check wiring for shorts", "Inspect motor bearings", "Check for mechanical jam"],
+    },
+    "temp": {
+        "label": "OVER-TEMPERATURE",
+        "causes": ["Inadequate cooling", "Overload heat", "Ambient temp rise", "Blocked ventilation"],
+        "actions": ["Check cooling fan", "Reduce duty cycle", "Improve ventilation", "Clean air vents"],
+    },
+    "vibe": {
+        "label": "HIGH VIBRATION",
+        "causes": ["Rotor imbalance", "Bearing wear", "Loose mounting", "Resonance"],
+        "actions": ["Balance rotor", "Inspect/replace bearings", "Tighten mounting bolts", "Check alignment"],
+    },
+    "sound": {
+        "label": "EXCESS NOISE",
+        "causes": ["Loose components", "Bearing noise", "Cavitation", "Belt/gear wear"],
+        "actions": ["Tighten all fasteners", "Lubricate bearings", "Check fluid levels", "Inspect drive components"],
+    },
+}
+
+
+# ══════════════════════════════════════════════════════════════════
+class EventLog:
+    def __init__(self, maxlen=80):
+        self.lock    = threading.Lock()
+        self._events = deque(maxlen=maxlen)
+
+    def add(self, kind, key, value, severity):
+        with self.lock:
+            self._events.append({
+                "time": time.time(), "kind": kind,
+                "key": key, "value": value, "severity": severity,
+            })
+
+    def get_all(self):
+        with self.lock:
+            return list(self._events)
+
+
+# ══════════════════════════════════════════════════════════════════
+class DataStore:
+    def __init__(self, maxlen=HISTORY_LEN):
+        self.lock   = threading.Lock()
+        self.times  = deque(maxlen=maxlen)
+        self.temp   = deque(maxlen=maxlen)
+        self.humid  = deque(maxlen=maxlen)
+        self.vibe   = deque(maxlen=maxlen)
+        self.amp    = deque(maxlen=maxlen)
+        self.sound  = deque(maxlen=maxlen)
+        self.health = deque(maxlen=maxlen)
+        self.alerts = {k: 0.0 for k in ["temp","vibe","amp","sound"]}
+        self._prev  = {k: False for k in ["temp","vibe","amp","sound"]}
+        self.connected = False
+        self.last_row  = None
+        self.event_log = EventLog()
+
+    def push(self, row):
+        t, h, v, a, s, va, ca, sa, ta = row
+        now   = time.time()
+        score = self._health(t, v, a, s)
+        amap  = {"vibe": bool(va), "amp": bool(ca), "sound": bool(sa), "temp": bool(ta)}
+        vals  = {"temp": t, "vibe": v, "amp": a, "sound": s}
+        with self.lock:
+            self.times.append(now); self.temp.append(t); self.humid.append(h)
+            self.vibe.append(v);    self.amp.append(a);  self.sound.append(s)
+            self.health.append(score)
+            for k, active in amap.items():
+                if active:
+                    self.alerts[k] = now
+                    if not self._prev[k]:
+                        ratio = vals[k]/THRESHOLDS[k] if THRESHOLDS[k] else 0
+                        sev = "CRITICAL" if ratio > 1.5 else "HIGH" if ratio > 1.2 else "MEDIUM"
+                        self.event_log.add("alert", k, vals[k], sev)
+                elif self._prev[k]:
+                    self.event_log.add("recovery", k, vals[k], "OK")
+                self._prev[k] = active
+            self.last_row = row
+
+    def _health(self, t, v, a, s):
+        def r(val, thr): return min(val/thr, 1.0) if thr > 0 else 0
+        pen = (
+            HEALTH_WEIGHTS["temp"]  * r(max(t-20, 0), max(THRESHOLDS["temp"]-20, 1)) +
+            HEALTH_WEIGHTS["vibe"]  * r(v, THRESHOLDS["vibe"]) +
+            HEALTH_WEIGHTS["amp"]   * r(a, THRESHOLDS["amp"]) +
+            HEALTH_WEIGHTS["sound"] * r(s, THRESHOLDS["sound"])
+        )
+        return max(0, 100 - pen*100)
+
+    def get_snapshot(self):
+        with self.lock:
+            return {
+                "times": list(self.times), "temp": list(self.temp),
+                "humid": list(self.humid), "vibe": list(self.vibe),
+                "amp":   list(self.amp),   "sound": list(self.sound),
+                "health":list(self.health),"alerts": dict(self.alerts),
+                "last":  self.last_row,    "events": self.event_log.get_all(),
+            }
+
+
+# ══════════════════════════════════════════════════════════════════
+class SerialReader(threading.Thread):
+    def __init__(self, port, store, log_writer, on_error):
+        super().__init__(daemon=True)
+        self.port=port; self.store=store; self.log_writer=log_writer
+        self.on_error=on_error; self.running=True; self._ser=None
+        self._send_lock = threading.Lock()
+
+    def send_command(self, cmd):
+        try:
+            if self._ser and self._ser.is_open:
+                with self._send_lock:
+                    self._ser.write((cmd.strip()+"\n").encode("utf-8"))
+        except Exception: pass
+
+    def run(self):
+        try:
+            self._ser = serial.Serial(self.port, BAUD_RATE, timeout=2)
+            time.sleep(2); self._ser.reset_input_buffer()
+            self.store.connected = True
+            while self.running:
+                try:
+                    raw = self._ser.readline()
+                    if not raw: continue
+                    line = raw.decode("utf-8", errors="ignore").strip()
+                except serial.SerialException: break
+                if not line or any(line.startswith(p) for p in
+                        ["FORMAT","MACHINE","READY","THRESH","RECAL","ERR","Calib"]):
+                    continue
+                parts = line.split(",")
+                if len(parts) != 9: continue
+                try:
+                    row = (float(parts[0]), float(parts[1]), float(parts[2]),
+                           float(parts[3]), int(float(parts[4])),
+                           int(parts[5]), int(parts[6]), int(parts[7]), int(parts[8]))
+                    if not (-10 < row[0] < 120): continue
+                    if not (0 <= row[1] <= 100): continue
+                    if row[3] < 0: continue
+                    self.store.push(row); self.log_writer(row)
+                except (ValueError, IndexError): continue
+        except serial.SerialException as e:
+            self.on_error(str(e))
+        finally:
+            self.store.connected = False
+            if self._ser and self._ser.is_open:
+                try: self._ser.close()
+                except Exception: pass
+
+    def stop(self): self.running = False
+
+
+# ══════════════════════════════════════════════════════════════════
+class InteractiveChart(tk.Canvas):
+    """Chart with hover crosshair, tooltip, threshold line, overlay series."""
+    def __init__(self, parent, color, threshold=None, label="", unit="", **kw):
+        super().__init__(parent, bg=T["PANEL"], highlightthickness=0, **kw)
+        self.color=color; self.threshold=threshold
+        self.label=label; self.unit=unit
+        self.data=[]; self.times_data=[]; self.overlay=[]
+        self._hover_x = None
+        self.bind("<Configure>", lambda e: self.redraw())
+        self.bind("<Motion>",    self._on_move)
+        self.bind("<Leave>",     self._on_leave)
+
+    def update_data(self, data, times=None, threshold=None, overlay=None):
+        self.data=list(data); self.times_data=list(times) if times else []
+        if threshold is not None: self.threshold=threshold
+        if overlay   is not None: self.overlay=overlay
+        self.redraw()
+
+    def _on_move(self, e): self._hover_x=e.x; self.redraw()
+    def _on_leave(self, e): self._hover_x=None; self.redraw()
+
+    def redraw(self):
+        self.config(bg=T["PANEL"]); self.delete("all")
+        w,h=self.winfo_width(),self.winfo_height()
+        if w<20 or h<20: return
+        PL,PR,PT,PB = 40,12,10,22
+        iw=w-PL-PR; ih=h-PT-PB
+
+        all_vals = list(self.data)
+        for ov in self.overlay: all_vals += list(ov.get("data",[]))
+        if self.threshold is not None: all_vals.append(self.threshold)
+        if not all_vals:
+            self.create_text(w//2,h//2,text="— waiting —",fill=T["SUBTEXT"],font=("Consolas",9))
+            return
+
+        dmin=min(all_vals); dmax=max(all_vals)
+        span=(dmax-dmin) if dmax!=dmin else max(abs(dmax)*0.2,0.001)
+        dmin-=span*0.08; dmax+=span*0.08; span=dmax-dmin
+
+        def xt(i,n): return PL+iw*i/max(n-1,1)
+        def yt(v):   return PT+ih*(1-(v-dmin)/span)
+
+        # Grid + Y labels
+        for i in range(5):
+            frac=i/4; y=PT+ih*frac; val=dmax-span*frac
+            self.create_line(PL,y,w-PR,y,fill=T["GRID"],width=1,dash=(2,4))
+            self.create_text(PL-4,y,text=f"{val:.2g}",anchor="e",
+                             fill=T["SUBTEXT"],font=("Consolas",7))
+
+        n=len(self.data)
+        if n>=2:
+            for frac in [0,0.25,0.5,0.75,1.0]:
+                xi=int(frac*(n-1)); x=xt(xi,n)
+                if self.times_data and xi<len(self.times_data):
+                    ago=int(time.time()-self.times_data[xi])
+                    lbl=f"-{ago}s" if ago>0 else "now"
+                else: lbl=""
+                self.create_text(x,h-5,text=lbl,fill=T["SUBTEXT"],font=("Consolas",7))
+
+        self.create_line(PL,PT,PL,h-PB,fill=T["BORDER"],width=1)
+        self.create_line(PL,h-PB,w-PR,h-PB,fill=T["BORDER"],width=1)
+
+        # Threshold
+        if self.threshold is not None:
+            ty=yt(self.threshold)
+            if PT<=ty<=h-PB:
+                self.create_line(PL,ty,w-PR,ty,fill=T["RED"],dash=(4,3),width=1)
+                self.create_text(w-PR-2,ty-7,text=f"THR {self.threshold:.3g}",
+                                 anchor="e",fill=T["RED"],font=("Consolas",7))
+
+        def draw_series(data,color,filled=True):
+            if len(data)<2: return
+            pts=[(xt(i,len(data)),yt(v)) for i,v in enumerate(data)]
+            if filled:
+                poly=[PL,h-PB]
+                for x2,y2 in pts: poly+=[x2,y2]
+                poly+=[w-PR,h-PB]
+                self.create_polygon(*poly,fill=self._dim(color,0.09),outline="")
+            flat=[]
+            for p in pts: flat+=[p[0],p[1]]
+            self.create_line(*flat,fill=color,width=2,smooth=True)
+            lx,ly=pts[-1]
+            self.create_oval(lx-4,ly-4,lx+4,ly+4,fill=color,outline=T["BG"],width=2)
+
+        for ov in self.overlay:
+            if ov.get("data"): draw_series(list(ov["data"]),ov["color"],filled=False)
+        if self.data:
+            draw_series(self.data,self.color)
+
+        # Value tag
+        if self.data:
+            v=self.data[-1]
+            col=T["RED"] if (self.threshold and v>=self.threshold) else self.color
+            self.create_text(w-PR,PT,text=f"{v:.3g}{self.unit}",
+                             anchor="ne",fill=col,font=("Consolas",9,"bold"))
+
+        # Hover
+        if self._hover_x is not None and self.data and n>=2:
+            idx=int((self._hover_x-PL)/max(iw,1)*(n-1))
+            idx=max(0,min(idx,n-1))
+            xc=xt(idx,n); val=self.data[idx]; yc=yt(val)
+            self.create_line(xc,PT,xc,h-PB,fill=T["BORDER2"],width=1,dash=(2,2))
+            self.create_line(PL,yc,w-PR,yc,fill=T["BORDER2"],width=1,dash=(2,2))
+            ts=""
+            if self.times_data and idx<len(self.times_data):
+                ts=datetime.datetime.fromtimestamp(self.times_data[idx]).strftime("%H:%M:%S")
+            tip=f" {self.label}  {val:.4g}{self.unit} \n {ts} "
+            tx=min(xc+8,w-115); ty2=max(yc-32,PT+2)
+            self.create_rectangle(tx,ty2,tx+110,ty2+30,fill=T["PANEL2"],outline=self.color,width=1)
+            self.create_text(tx+55,ty2+15,text=tip,fill=self.color,
+                             font=("Consolas",8),justify="center")
+            self.create_oval(xc-5,yc-5,xc+5,yc+5,fill=self.color,outline=T["BG"],width=2)
+
+    @staticmethod
+    def _dim(hx, alpha):
+        try:
+            bg=T["BG"]
+            r=int(int(hx[1:3],16)*alpha+int(bg[1:3],16)*(1-alpha))
+            g=int(int(hx[3:5],16)*alpha+int(bg[3:5],16)*(1-alpha))
+            b=int(int(hx[5:7],16)*alpha+int(bg[5:7],16)*(1-alpha))
+            return f"#{r:02x}{g:02x}{b:02x}"
+        except: return T["PANEL"]
+
+
+# ══════════════════════════════════════════════════════════════════
+class RingGauge(tk.Canvas):
+    def __init__(self, parent, size=185, **kw):
+        super().__init__(parent, bg=T["BG"], highlightthickness=0,
+                         width=size, height=size, **kw)
+        self.size=size; self._score=100.0; self._anim=100.0; self._prev=100.0
+        self.bind("<Configure>", lambda e: self.redraw())
+
+    def set_score(self, score):
+        self._prev=self._score; self._score=score; self._tick()
+
+    def _tick(self):
+        diff=self._score-self._anim; self._anim+=diff*0.18; self.redraw()
+        if abs(diff)>0.2: self.after(30,self._tick)
+
+    def redraw(self):
+        self.config(bg=T["BG"]); self.delete("all")
+        w,h=self.winfo_width(),self.winfo_height()
+        if w<20: return
+        cx,cy=w//2,h//2; r=min(cx,cy)-18; r2=r-16
+        for i in range(11):
+            ang=math.radians(225-i*27); major=(i%2==0)
+            ro=r+5; ri=r+(5 if not major else 12)
+            self.create_line(cx+ro*math.cos(ang),cy-ro*math.sin(ang),
+                             cx+ri*math.cos(ang),cy-ri*math.sin(ang),
+                             fill=T["BORDER2"] if not major else T["SUBTEXT"],width=1)
+        self.create_arc(cx-r,cy-r,cx+r,cy+r,start=-225,extent=270,
+                        style="arc",outline=T["BORDER"],width=14)
+        col=self._col(self._anim)
+        self.create_arc(cx-r,cy-r,cx+r,cy+r,start=-225,
+                        extent=270*(self._anim/100),
+                        style="arc",outline=col,width=14)
+        self.create_arc(cx-r2,cy-r2,cx+r2,cy+r2,start=0,extent=359,
+                        style="arc",outline=T["DIM"],width=2)
+        delta=self._score-self._prev
+        arrow="▲" if delta>0.5 else "▼" if delta<-0.5 else "─"
+        acol=T["GREEN"] if delta>0 else T["RED"] if delta<-0.5 else T["SUBTEXT"]
+        self.create_text(cx,cy-16,text=f"{self._anim:.0f}",
+                         fill=col,font=("Consolas",28,"bold"))
+        self.create_text(cx,cy+12,text="HEALTH SCORE",
+                         fill=T["SUBTEXT"],font=("Consolas",7,"bold"))
+        self.create_text(cx,cy+28,text=self._status(self._anim),
+                         fill=col,font=("Consolas",9,"bold"))
+        self.create_text(cx+r-14,cy-r+14,text=arrow,
+                         fill=acol,font=("Consolas",12,"bold"))
+
+    def _col(self,s):
+        return T["GREEN"] if s>=75 else T["YELLOW"] if s>=45 else T["RED"]
+    def _status(self,s):
+        return "HEALTHY" if s>=80 else "CAUTION" if s>=60 else "WARNING" if s>=40 else "CRITICAL"
+
+
+# ══════════════════════════════════════════════════════════════════
+class HealthBreakdown(tk.Canvas):
+    KEYS=[("TEMP","temp","ORANGE"),("VIBE","vibe","YELLOW"),
+          ("AMP","amp","GREEN"),("NOISE","sound","PURPLE")]
+    def __init__(self,parent,**kw):
+        super().__init__(parent,bg=T["PANEL2"],highlightthickness=0,height=100,**kw)
+        self._ratios={k:0.0 for _,k,_ in self.KEYS}
+        self.bind("<Configure>",lambda e:self.redraw())
+
+    def update(self, last_row):
+        if not last_row: return
+        t,h,v,a,s=last_row[0],last_row[1],last_row[2],last_row[3],last_row[4]
+        vals={"temp":max(t-20,0),"vibe":v,"amp":a,"sound":s}
+        thrs={"temp":max(THRESHOLDS["temp"]-20,1),"vibe":THRESHOLDS["vibe"],
+              "amp":THRESHOLDS["amp"],"sound":THRESHOLDS["sound"]}
+        for _,k,_ in self.KEYS:
+            self._ratios[k]=min(vals[k]/thrs[k],1.5) if thrs[k] else 0
+        self.redraw()
+
+    def redraw(self):
+        self.config(bg=T["PANEL2"]); self.delete("all")
+        w,h=self.winfo_width(),self.winfo_height()
+        if w<20: return
+        rh=h//len(self.KEYS)
+        for i,(lbl,key,ck) in enumerate(self.KEYS):
+            color=T[ck]; ratio=self._ratios.get(key,0)
+            yc=i*rh+rh//2
+            self.create_text(6,yc,text=lbl,anchor="w",
+                             fill=T["SUBTEXT"],font=("Consolas",7,"bold"))
+            bx0,bx1=52,w-64; bw=bx1-bx0
+            self.create_rectangle(bx0,yc-4,bx1,yc+4,fill=T["DIM"],outline="")
+            fw=int(bw*min(ratio,1.0))
+            bc=T["GREEN"] if ratio<0.6 else T["YELLOW"] if ratio<0.9 else T["RED"]
+            if fw>0: self.create_rectangle(bx0,yc-4,bx0+fw,yc+4,fill=bc,outline="")
+            st="OK" if ratio<0.6 else "WARN" if ratio<0.9 else "HIGH" if ratio<1.0 else "OVER"
+            self.create_text(w-6,yc,text=st,anchor="e",
+                             fill=bc,font=("Consolas",7,"bold"))
+
+
+# ══════════════════════════════════════════════════════════════════
+class SmartAlertPanel(tk.Frame):
+    ORDER=[("amp","OVERCURRENT"),("temp","OVER-TEMP"),
+           ("vibe","VIBRATION"),("sound","NOISE")]
+    def __init__(self,parent,**kw):
+        super().__init__(parent,bg=T["PANEL"],**kw)
+        self._cards={}
+        for key,label in self.ORDER:
+            c=self._card(key,label); c.pack(fill="x",padx=4,pady=2)
+            self._cards[key]=c
+
+    def _card(self,key,label):
+        info=ALERT_INFO[key]
+        f=tk.Frame(self,bg=T["PANEL2"],highlightbackground=T["BORDER"],highlightthickness=1)
+        top=tk.Frame(f,bg=T["PANEL2"]); top.pack(fill="x",padx=6,pady=(5,1))
+        dot=tk.Label(top,text="◆",font=("Consolas",11),bg=T["PANEL2"],fg=T["DIM"])
+        dot.pack(side="left",padx=(0,4))
+        lbl=tk.Label(top,text=label,font=("Consolas",8,"bold"),bg=T["PANEL2"],fg=T["SUBTEXT"])
+        lbl.pack(side="left")
+        sev=tk.Label(top,text="",font=("Consolas",7),bg=T["PANEL2"],fg=T["SUBTEXT"])
+        sev.pack(side="right")
+        det=tk.Label(f,text="",font=("Consolas",7),bg=T["PANEL2"],fg=T["SUBTEXT"],
+                     justify="left",anchor="w",wraplength=220)
+        det.pack(fill="x",padx=12,pady=(0,5))
+        f.dot=dot; f.lbl=lbl; f.sev=sev; f.det=det; f.active=False
+        return f
+
+    def update(self,alerts,now):
+        for key,card in self._cards.items():
+            last_t=alerts.get(key,0); active=(now-last_t)<ALERT_DECAY
+            info=ALERT_INFO[key]
+            if active and not card.active:
+                card.active=True
+                card.config(highlightbackground=T["RED"])
+                card.dot.config(fg=T["RED"]); card.lbl.config(fg=T["TEXT"])
+                card.sev.config(text="ACTIVE",fg=T["RED"])
+                idx=int(last_t)%len(info["causes"])
+                ts=datetime.datetime.fromtimestamp(last_t).strftime("%H:%M:%S")
+                card.det.config(
+                    text=f"⏱ {ts}   Cause: {info['causes'][idx]}\n→ {info['actions'][idx]}",
+                    fg=T["SUBTEXT"])
+            elif not active and card.active:
+                card.active=False
+                card.config(highlightbackground=T["BORDER"])
+                card.dot.config(fg=T["DIM"]); card.lbl.config(fg=T["SUBTEXT"])
+                card.sev.config(text=""); card.det.config(text="")
+
+
+# ══════════════════════════════════════════════════════════════════
+class EventTimeline(tk.Canvas):
+    def __init__(self,parent,on_click=None,**kw):
+        super().__init__(parent,bg=T["PANEL2"],highlightthickness=0,height=52,**kw)
+        self._events=[]; self._on_click=on_click; self._start_t=None
+        self.bind("<Configure>",lambda e:self.redraw())
+        self.bind("<Button-1>",self._click)
+
+    def update_events(self,events):
+        self._events=events
+        if events and self._start_t is None: self._start_t=events[0]["time"]
+        self.redraw()
+
+    def _click(self,event):
+        if self._on_click and self._events:
+            idx=self._nearest(event.x)
+            if idx is not None: self._on_click(self._events[idx])
+
+    def _nearest(self,x):
+        w=self.winfo_width()
+        if not self._events or not self._start_t: return None
+        span=max(time.time()-self._start_t,1); best,bd=None,999
+        for i,ev in enumerate(self._events):
+            ex=10+(w-20)*(ev["time"]-self._start_t)/span
+            if abs(ex-x)<bd: best,bd=i,abs(ex-x)
+        return best if bd<20 else None
+
+    def redraw(self):
+        self.config(bg=T["PANEL2"]); self.delete("all")
+        w,h=self.winfo_width(),self.winfo_height()
+        if w<20: return
+        now=time.time(); start=self._start_t or now; span=max(now-start,1)
+        self.create_line(10,30,w-10,30,fill=T["BORDER2"],width=1)
+        for frac in [0,0.25,0.5,0.75,1.0]:
+            x=10+(w-20)*frac; t_s=start+span*frac
+            lbl=datetime.datetime.fromtimestamp(t_s).strftime("%H:%M")
+            self.create_line(x,26,x,34,fill=T["BORDER"],width=1)
+            self.create_text(x,44,text=lbl,fill=T["SUBTEXT"],font=("Consolas",6))
+        EV_COL={"alert":T["RED"],"recovery":T["GREEN"],"info":T["BLUE"]}
+        SYM={"amp":"A","temp":"T","vibe":"V","sound":"S"}
+        for ev in self._events:
+            ex=10+(w-20)*(ev["time"]-start)/span
+            col=EV_COL.get(ev["kind"],T["SUBTEXT"]); sym=SYM.get(ev["key"],"?")
+            if ev["kind"]=="alert":
+                self.create_polygon(ex,15,ex-6,27,ex+6,27,fill=col,outline="")
+                self.create_text(ex,21,text=sym,fill=T["BG"],font=("Consolas",6,"bold"))
+            elif ev["kind"]=="recovery":
+                self.create_polygon(ex,27,ex-6,15,ex+6,15,fill=col,outline="")
+                self.create_text(ex,21,text=sym,fill=T["BG"],font=("Consolas",6,"bold"))
+            else:
+                self.create_oval(ex-4,25,ex+4,33,fill=col,outline="")
+
+
+# ══════════════════════════════════════════════════════════════════
+class CorrelationPanel(tk.Frame):
+    def __init__(self,parent,**kw):
+        super().__init__(parent,bg=T["PANEL"],**kw)
+        self._lbl=tk.Label(self,text="",bg=T["PANEL"],fg=T["SUBTEXT"],
+                           font=("Consolas",8),justify="left",anchor="nw",wraplength=240)
+        self._lbl.pack(fill="both",expand=True,padx=8,pady=6)
+
+    def update(self,snap):
+        last=snap.get("last")
+        if not last: self._lbl.config(text="Waiting…"); return
+        t,h,v,a,s=last[0],last[1],last[2],last[3],last[4]
+        vh=v>=THRESHOLDS["vibe"]*0.8; ah=a>=THRESHOLDS["amp"]*0.8
+        th=t>=THRESHOLDS["temp"]*0.9; sh=s>=THRESHOLDS["sound"]*0.8
+        insights=[]
+        if vh and ah:
+            insights.append(("⚠ Vibe + Current spike","Mechanical load issue → Check shaft",T["RED"]))
+        elif vh and sh:
+            insights.append(("⚠ Vibe + Noise elevated","Bearing wear → Inspect drive train",T["YELLOW"]))
+        elif th and ah:
+            insights.append(("⚠ Temp + Current high","Motor overloading → Reduce load",T["ORANGE"]))
+        elif th and not ah:
+            insights.append(("ℹ Temp rising, current OK","Cooling issue → Check ventilation",T["YELLOW"]))
+        elif ah and not vh:
+            insights.append(("ℹ Current high, vibe OK","Electrical load → Check supply",T["BLUE"]))
+        sc=snap["health"][-1] if snap["health"] else 100
+        if not insights:
+            col=T["GREEN"] if sc>80 else T["YELLOW"]
+            insights.append(("✓ No correlations detected","All systems normal.",col))
+        lines=[]
+        for title,body,_ in insights:
+            lines.append(title); lines.append(f"  {body}")
+        self._lbl.config(text="\n".join(lines),fg=insights[0][2])
+
+
+# ══════════════════════════════════════════════════════════════════
+class ThresholdPanel(tk.LabelFrame):
+    def __init__(self,parent,send_callback,**kw):
+        super().__init__(parent,text=" THRESHOLD CONTROL ",
+                         bg=T["PANEL"],fg=T["CYAN"],
+                         font=("Consolas",8,"bold"),bd=1,relief="flat",
+                         highlightbackground=T["BORDER"],highlightthickness=1,**kw)
+        self._send=send_callback
+        controls=[
+            ("TEMP","temp","°C",0.0,80.0,0.5,"SET_TEMP:"),
+            ("AMP","amp","A",0.1,10.0,0.05,"SET_AMP:"),
+            ("VIBE","vibe","g",0.01,1.0,0.005,"SET_VIBE:"),
+            ("SOUND","sound","",5,200,1,"SET_SND:"),
+        ]
+        self._vars={}; self._lbls={}; self._dots={}
+        for ri,(label,key,unit,lo,hi,step,cmd) in enumerate(controls):
+            tk.Label(self,text=label,bg=T["PANEL"],fg=T["SUBTEXT"],
+                     font=("Consolas",7,"bold")).grid(row=ri,column=0,sticky="w",padx=(8,2),pady=3)
+            var=tk.DoubleVar(value=THRESHOLDS[key]); self._vars[key]=var
+            vl=tk.Label(self,text=f"{THRESHOLDS[key]:.3g}{unit}",
+                        bg=T["PANEL"],fg=T["CYAN"],font=("Consolas",8,"bold"),width=8,anchor="e")
+            vl.grid(row=ri,column=1,padx=2); self._lbls[key]=(vl,unit)
+            dot=tk.Canvas(self,bg=T["PANEL"],highlightthickness=0,width=12,height=12)
+            dot.grid(row=ri,column=2,padx=2); self._dots[key]=dot
+            sl=tk.Scale(self,from_=lo,to=hi,resolution=step,orient="horizontal",
+                        variable=var,bg=T["PANEL"],fg=T["TEXT"],troughcolor=T["DIM"],
+                        activebackground=T["CYAN"],highlightthickness=0,bd=0,
+                        showvalue=False,length=120)
+            sl.grid(row=ri,column=3,padx=2,pady=2)
+            sl.bind("<ButtonRelease-1>",lambda e,k=key,c=cmd,v=var,u=unit:self._push(k,c,v,u))
+            bf=tk.Frame(self,bg=T["PANEL"]); bf.grid(row=ri,column=4,padx=(2,8))
+            for sign,sym in [(-1,"−"),(+1,"+")]:
+                st=step*sign
+                tk.Button(bf,text=sym,bg=T["BORDER2"],fg=T["TEXT"],
+                          font=("Consolas",9,"bold"),bd=0,width=2,padx=1,
+                          activebackground=T["CYAN"],activeforeground=T["BG"],
+                          command=lambda k=key,c=cmd,v=var,s2=st,u=unit:
+                                  self._step(k,c,v,s2,u)).pack(side="left",padx=1)
+
+    def _push(self,key,cmd,var,unit):
+        val=var.get(); THRESHOLDS[key]=val
+        lbl,u=self._lbls[key]; lbl.config(text=f"{val:.3g}{u}")
+        self._send(f"{cmd}{val:.4f}")
+
+    def _step(self,key,cmd,var,step,unit):
+        var.set(var.get()+step); self._push(key,cmd,var,unit)
+
+    def update_proximity(self,last_row):
+        if not last_row: return
+        vals={"temp":last_row[0],"vibe":last_row[2],"amp":last_row[3],"sound":last_row[4]}
+        for key,dot in self._dots.items():
+            dot.config(bg=T["PANEL"]); dot.delete("all")
+            ratio=vals.get(key,0)/THRESHOLDS[key] if THRESHOLDS[key] else 0
+            col=T["GREEN"] if ratio<0.6 else T["YELLOW"] if ratio<0.9 else T["RED"]
+            dot.create_oval(1,1,11,11,fill=col,outline="")
+
+
+# ══════════════════════════════════════════════════════════════════
+class StatusBanner(tk.Frame):
+    def __init__(self,parent,**kw):
+        super().__init__(parent,height=30,**kw)
+        self.pack_propagate(False)
+        self._left=tk.Label(self,font=("Consolas",9,"bold"),anchor="w")
+        self._left.pack(side="left",fill="both",expand=True,padx=14)
+        self._right=tk.Label(self,font=("Consolas",8),anchor="e")
+        self._right.pack(side="right",padx=14)
+
+    def update(self,alerts,now,snap):
+        active=[k for k,t in alerts.items() if (now-t)<ALERT_DECAY]
+        last=snap.get("last")
+        if active:
+            labels=[ALERT_INFO[k]["label"] for k in active]
+            txt=f"▓ WARNING  ·  {', '.join(labels)} detected  ·  Immediate action required"
+            bg,fg=T["RED"],"#000000"; detail=f"Active: {len(active)}"
+        else:
+            near=[]
+            if last:
+                vals={"temp":last[0],"vibe":last[2],"amp":last[3],"sound":last[4]}
+                near=[k for k,v in vals.items() if THRESHOLDS[k] and v/THRESHOLDS[k]>=0.8]
+            if near:
+                txt=f"◈ CAUTION  ·  {', '.join(n.upper() for n in near)} approaching threshold"
+                bg,fg=T["YELLOW"],"#000000"; detail="Monitor closely"
+            else:
+                txt="◆ NORMAL  ·  All parameters within safe range  ·  System operating correctly"
+                bg,fg=T["GREEN"],"#000000"
+                h=snap["health"][-1] if snap.get("health") else 100
+                detail=f"Health: {h:.0f}/100"
+        self.config(bg=bg)
+        self._left.config(text=txt,bg=bg,fg=fg)
+        self._right.config(text=detail,bg=bg,fg=fg)
+
+
+# ══════════════════════════════════════════════════════════════════
+class PredictionEngine:
+    @staticmethod
+    def analyze(snap):
+        if len(snap["times"])<10: return None
+        result={}; t_arr=np.array(snap["times"]); t_arr-=t_arr[0]
+        for key,vals in [("temp",snap["temp"]),("vibe",snap["vibe"]),
+                         ("amp",snap["amp"]),("health",snap["health"])]:
+            if len(vals)<5: continue
+            arr=np.array(vals[-TREND_WINDOW:]); t=t_arr[-len(arr):]
+            sl,ic,r,_,_=linregress(t,arr)
+            result[key]={"slope":sl,"r2":r**2,"current":arr[-1]}
+        preds=[]
+        for ch,thr in THRESHOLDS.items():
+            if ch not in result: continue
+            rd=result[ch]
+            if rd["slope"]>0 and rd["current"]<thr:
+                rem=(thr-rd["current"])/rd["slope"]
+                if 0<rem<600:
+                    conf="HIGH" if rd["r2"]>0.7 else "MED" if rd["r2"]>0.4 else "LOW"
+                    preds.append((ch.upper(),rem/60,rd["slope"],rd["r2"],conf))
+        return {"channels":result,"predictions":preds,
+                "health_slope":result.get("health",{}).get("slope",0)}
+
+
+# ══════════════════════════════════════════════════════════════════
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("⬡ MACHINE HEALTH MONITOR  v3.0")
+        self.geometry("1400x880"); self.minsize(1100,720)
+        self._dark_mode=True; apply_theme(DARK)
+        self.configure(bg=T["BG"])
+        self.store=DataStore(); self.reader=None
+        self._setup_log(); self._build_ui(); self._refresh()
+
+    def _setup_log(self):
+        wh=not os.path.exists(LOG_FILE)
+        self.log_f=open(LOG_FILE,"a",newline="")
+        self.csv_w=csv.writer(self.log_f)
+        if wh: self.csv_w.writerow(["timestamp","temp","humid","vibe","amp","sound",
+                                     "vibe_alert","curr_alert","sound_alert","temp_alert"])
+
+    def _log_row(self,row):
+        ts=datetime.datetime.now().isoformat(timespec="seconds")
+        self.csv_w.writerow([ts]+list(row)); self.log_f.flush()
+
+    def _on_serial_error(self,msg):
+        self.store.connected=False
+        try: self._set_status(f"⚠  ERROR: {msg}",T["RED"])
+        except Exception: pass
+
+    def _build_ui(self):
+        # ═ HEADER ════════════════════════════════════════════════
+        hdr=tk.Frame(self,bg=T["PANEL"],height=46)
+        hdr.pack(fill="x"); hdr.pack_propagate(False)
+
+        tf=tk.Frame(hdr,bg=T["PANEL"]); tf.pack(side="left",padx=14)
+        tk.Label(tf,text="⬡",font=("Consolas",18),bg=T["PANEL"],
+                 fg=T["CYAN"]).pack(side="left",padx=(0,6))
+        tk.Label(tf,text="MACHINE HEALTH MONITOR",font=("Consolas",12,"bold"),
+                 bg=T["PANEL"],fg=T["TEXT"]).pack(side="left")
+        tk.Label(tf,text="  v3.0  PRO  NANO",font=("Consolas",8),
+                 bg=T["PANEL"],fg=T["SUBTEXT"]).pack(side="left")
+
+        rf=tk.Frame(hdr,bg=T["PANEL"]); rf.pack(side="right",padx=10)
+        self._theme_btn=tk.Button(rf,text="☀ LIGHT",bg=T["BORDER2"],fg=T["TEXT"],
+                                   font=("Consolas",7,"bold"),bd=0,padx=8,pady=4,
+                                   activebackground=T["CYAN"],activeforeground=T["BG"],
+                                   command=self._toggle_theme)
+        self._theme_btn.pack(side="left",padx=4)
+
+        for lbl,cmd in [("⟳ RECAL",self._recalibrate),
+                         ("⬇ EXPORT",self._export_csv),
+                         ("✕ CLEAR",self._clear_log)]:
+            tk.Button(rf,text=lbl,bg=T["BORDER2"],fg=T["TEXT"],
+                      font=("Consolas",7,"bold"),bd=0,padx=7,pady=4,
+                      activebackground=T["CYAN"],activeforeground=T["BG"],
+                      command=cmd).pack(side="left",padx=2)
+
+        tk.Label(rf,text=" │ ",bg=T["PANEL"],fg=T["BORDER2"]).pack(side="left")
+        tk.Label(rf,text="PORT",font=("Consolas",8),bg=T["PANEL"],
+                 fg=T["SUBTEXT"]).pack(side="left",padx=(4,3))
+        self.port_var=tk.StringVar()
+        sty=ttk.Style(); sty.theme_use("clam")
+        sty.configure("TCombobox",fieldbackground=T["PANEL2"],background=T["PANEL2"],
+                      foreground=T["TEXT"],selectbackground=T["BORDER2"],arrowcolor=T["CYAN"])
+        self.port_cb=ttk.Combobox(rf,textvariable=self.port_var,width=10,
+                                   state="readonly",font=("Consolas",9))
+        self.port_cb.pack(side="left",padx=2); self._refresh_ports()
+        tk.Button(rf,text="↺",bg=T["PANEL2"],fg=T["CYAN"],bd=0,padx=5,
+                  font=("Consolas",10),command=self._refresh_ports).pack(side="left",padx=1)
+        self.conn_btn=tk.Button(rf,text=" CONNECT ",bg=T["CYAN"],fg=T["BG"],
+                                 font=("Consolas",8,"bold"),bd=0,padx=8,pady=4,
+                                 command=self._toggle_connect)
+        self.conn_btn.pack(side="left",padx=6)
+
+        # ═ BANNER ════════════════════════════════════════════════
+        self.banner=StatusBanner(self,bg=T["GREEN"])
+        self.banner.pack(fill="x")
+
+        # ═ STATUS STRIP ══════════════════════════════════════════
+        ss=tk.Frame(self,bg=T["PANEL2"],height=18); ss.pack(fill="x"); ss.pack_propagate(False)
+        self.status_lbl=tk.Label(ss,text="◆ DISCONNECTED",bg=T["PANEL2"],
+                                  fg=T["SUBTEXT"],font=("Consolas",7))
+        self.status_lbl.pack(side="left",padx=12)
+        self.sample_lbl=tk.Label(ss,text="",bg=T["PANEL2"],
+                                  fg=T["SUBTEXT"],font=("Consolas",7))
+        self.sample_lbl.pack(side="right",padx=12)
+
+        # ═ BODY ══════════════════════════════════════════════════
+        body=tk.Frame(self,bg=T["BG"])
+        body.pack(fill="both",expand=True,padx=8,pady=6)
+        body.columnconfigure(0,weight=0,minsize=210)
+        body.columnconfigure(1,weight=1)
+        body.columnconfigure(2,weight=0,minsize=272)
+        body.rowconfigure(0,weight=1)
+
+        # ─ LEFT ─────────────────────────────────────────────────
+        left=tk.Frame(body,bg=T["BG"])
+        left.grid(row=0,column=0,sticky="nsew",padx=(0,6))
+
+        gf=tk.Frame(left,bg=T["PANEL2"],highlightbackground=T["BORDER"],highlightthickness=1)
+        gf.pack(fill="x",pady=(0,4))
+        self.gauge=RingGauge(gf,size=185); self.gauge.pack(padx=8,pady=8)
+
+        bkf=tk.Frame(left,bg=T["PANEL2"],highlightbackground=T["BORDER"],highlightthickness=1)
+        bkf.pack(fill="x",pady=(0,4))
+        tk.Label(bkf,text="SENSOR BREAKDOWN",bg=T["PANEL2"],fg=T["SUBTEXT"],
+                 font=("Consolas",7,"bold")).pack(anchor="w",padx=8,pady=(4,0))
+        self.breakdown=HealthBreakdown(bkf); self.breakdown.pack(fill="x",padx=4,pady=(0,4))
+
+        self.tiles={}
+        tile_defs=[("TEMP","°C",T["ORANGE"],"temp"),("HUMID","%",T["BLUE"],"humid"),
+                   ("VIBE","g",T["YELLOW"],"vibe"),("AMP","A",T["GREEN"],"amp"),
+                   ("NOISE","",T["PURPLE"],"sound")]
+        for label,unit,color,key in tile_defs:
+            f=tk.Frame(left,bg=T["PANEL2"],highlightbackground=T["BORDER"],highlightthickness=1)
+            f.pack(fill="x",pady=2)
+            row_f=tk.Frame(f,bg=T["PANEL2"]); row_f.pack(fill="x",padx=6,pady=3)
+            tk.Label(row_f,text=label,bg=T["PANEL2"],fg=T["SUBTEXT"],
+                     font=("Consolas",7,"bold"),width=6,anchor="w").pack(side="left")
+            vl=tk.Label(row_f,text="--",bg=T["PANEL2"],fg=color,font=("Consolas",12,"bold"))
+            vl.pack(side="right")
+            f.val_lbl=vl; f.color=color; f.unit=unit; self.tiles[key]=f
+
+        # ─ CENTRE ───────────────────────────────────────────────
+        centre=tk.Frame(body,bg=T["BG"])
+        centre.grid(row=0,column=1,sticky="nsew",padx=(0,6))
+        centre.rowconfigure(1,weight=1); centre.columnconfigure(0,weight=1)
+
+        # Tab bar
+        tab_bar=tk.Frame(centre,bg=T["PANEL2"],height=28)
+        tab_bar.grid(row=0,column=0,sticky="ew",pady=(0,4)); tab_bar.pack_propagate(False)
+        self._tab_btns={}; self._tab_frames={}; self._active_tab=tk.StringVar(value="overview")
+        for key,label in [("overview","OVERVIEW"),("temp","TEMPERATURE"),
+                           ("vibe","VIBRATION"),("electrical","ELECTRICAL"),("noise","NOISE")]:
+            b=tk.Button(tab_bar,text=label,font=("Consolas",7,"bold"),bd=0,padx=10,
+                        bg=T["PANEL2"],fg=T["SUBTEXT"],activebackground=T["PANEL"],
+                        command=lambda k=key:self._switch_tab(k))
+            b.pack(side="left",padx=1,pady=2); self._tab_btns[key]=b
+
+        chart_host=tk.Frame(centre,bg=T["BG"])
+        chart_host.grid(row=1,column=0,sticky="nsew")
+        chart_host.rowconfigure(0,weight=1); chart_host.columnconfigure(0,weight=1)
+        self.charts={}
+
+        # Overview (2×2)
+        ov=tk.Frame(chart_host,bg=T["BG"])
+        ov.grid(row=0,column=0,sticky="nsew")
+        ov.rowconfigure([0,1],weight=1); ov.columnconfigure([0,1],weight=1)
+        self._tab_frames["overview"]=ov
+        for lbl,col,key,thr_key,ri,ci in [
+            ("TEMPERATURE + HUMIDITY",T["ORANGE"],"temp","temp",0,0),
+            ("VIBRATION RMS",T["YELLOW"],"vibe","vibe",0,1),
+            ("CURRENT",T["GREEN"],"amp","amp",1,0),
+            ("HEALTH SCORE",T["CYAN"],"health",None,1,1)]:
+            cf=tk.Frame(ov,bg=T["PANEL2"],highlightbackground=T["BORDER"],highlightthickness=1)
+            cf.grid(row=ri,column=ci,sticky="nsew",padx=3,pady=3)
+            cf.rowconfigure(1,weight=1); cf.columnconfigure(0,weight=1)
+            tk.Label(cf,text=lbl,bg=T["PANEL2"],fg=T["SUBTEXT"],
+                     font=("Consolas",7,"bold")).grid(row=0,column=0,sticky="w",padx=8,pady=(4,0))
+            thr=THRESHOLDS.get(thr_key) if thr_key else None
+            c=InteractiveChart(cf,col,threshold=thr,label=key,unit="")
+            c.grid(row=1,column=0,sticky="nsew",padx=4,pady=(0,4))
+            self.charts[f"ov_{key}"]=c
+
+        # Temp tab
+        tf2=tk.Frame(chart_host,bg=T["BG"])
+        tf2.grid(row=0,column=0,sticky="nsew")
+        tf2.rowconfigure([0,1],weight=1); tf2.columnconfigure(0,weight=1)
+        self._tab_frames["temp"]=tf2
+        for i,(lbl,col,key,thr_key) in enumerate([
+                ("TEMPERATURE (°C)",T["ORANGE"],"temp","temp"),
+                ("HUMIDITY (%)",T["BLUE"],"humid",None)]):
+            cf=tk.Frame(tf2,bg=T["PANEL2"],highlightbackground=T["BORDER"],highlightthickness=1)
+            cf.grid(row=i,column=0,sticky="nsew",padx=3,pady=3)
+            cf.rowconfigure(1,weight=1); cf.columnconfigure(0,weight=1)
+            tk.Label(cf,text=lbl,bg=T["PANEL2"],fg=T["SUBTEXT"],
+                     font=("Consolas",7,"bold")).grid(row=0,column=0,sticky="w",padx=8,pady=(4,0))
+            thr=THRESHOLDS.get(thr_key) if thr_key else None
+            c=InteractiveChart(cf,col,threshold=thr,label=key,unit="")
+            c.grid(row=1,column=0,sticky="nsew",padx=4,pady=(0,4))
+            self.charts[f"tt_{key}"]=c
+
+        # Vibe tab
+        vf=tk.Frame(chart_host,bg=T["BG"])
+        vf.grid(row=0,column=0,sticky="nsew")
+        vf.rowconfigure(0,weight=1); vf.columnconfigure(0,weight=1)
+        self._tab_frames["vibe"]=vf
+        cf=tk.Frame(vf,bg=T["PANEL2"],highlightbackground=T["BORDER"],highlightthickness=1)
+        cf.grid(row=0,column=0,sticky="nsew",padx=3,pady=3)
+        cf.rowconfigure(1,weight=1); cf.columnconfigure(0,weight=1)
+        tk.Label(cf,text="VIBRATION RMS (g) — FULL DETAIL",bg=T["PANEL2"],fg=T["SUBTEXT"],
+                 font=("Consolas",7,"bold")).grid(row=0,column=0,sticky="w",padx=8,pady=(4,0))
+        c=InteractiveChart(cf,T["YELLOW"],threshold=THRESHOLDS["vibe"],label="vibe",unit="g")
+        c.grid(row=1,column=0,sticky="nsew",padx=4,pady=(0,4))
+        self.charts["tv_vibe"]=c
+
+        # Electrical tab
+        ef=tk.Frame(chart_host,bg=T["BG"])
+        ef.grid(row=0,column=0,sticky="nsew")
+        ef.rowconfigure(0,weight=1); ef.columnconfigure(0,weight=1)
+        self._tab_frames["electrical"]=ef
+        cf=tk.Frame(ef,bg=T["PANEL2"],highlightbackground=T["BORDER"],highlightthickness=1)
+        cf.grid(row=0,column=0,sticky="nsew",padx=3,pady=3)
+        cf.rowconfigure(1,weight=1); cf.columnconfigure(0,weight=1)
+        tk.Label(cf,text="CURRENT (A) — ACS712 SENSOR",bg=T["PANEL2"],fg=T["SUBTEXT"],
+                 font=("Consolas",7,"bold")).grid(row=0,column=0,sticky="w",padx=8,pady=(4,0))
+        c=InteractiveChart(cf,T["GREEN"],threshold=THRESHOLDS["amp"],label="amp",unit="A")
+        c.grid(row=1,column=0,sticky="nsew",padx=4,pady=(0,4))
+        self.charts["te_amp"]=c
+
+        # Noise tab
+        nf=tk.Frame(chart_host,bg=T["BG"])
+        nf.grid(row=0,column=0,sticky="nsew")
+        nf.rowconfigure(0,weight=1); nf.columnconfigure(0,weight=1)
+        self._tab_frames["noise"]=nf
+        cf=tk.Frame(nf,bg=T["PANEL2"],highlightbackground=T["BORDER"],highlightthickness=1)
+        cf.grid(row=0,column=0,sticky="nsew",padx=3,pady=3)
+        cf.rowconfigure(1,weight=1); cf.columnconfigure(0,weight=1)
+        tk.Label(cf,text="SOUND LEVEL — KY-037 MIC",bg=T["PANEL2"],fg=T["SUBTEXT"],
+                 font=("Consolas",7,"bold")).grid(row=0,column=0,sticky="w",padx=8,pady=(4,0))
+        c=InteractiveChart(cf,T["PURPLE"],threshold=THRESHOLDS["sound"],label="sound",unit="")
+        c.grid(row=1,column=0,sticky="nsew",padx=4,pady=(0,4))
+        self.charts["tn_sound"]=c
+
+        # Timeline row
+        centre.rowconfigure(2,weight=0)
+        tl_f=tk.Frame(centre,bg=T["PANEL2"],highlightbackground=T["BORDER"],highlightthickness=1)
+        tl_f.grid(row=2,column=0,sticky="ew",pady=(4,0))
+        tk.Label(tl_f,text="EVENT TIMELINE  (click marker for details)",
+                 bg=T["PANEL2"],fg=T["SUBTEXT"],font=("Consolas",7,"bold")).pack(
+                     anchor="w",padx=8,pady=(3,0))
+        self.timeline=EventTimeline(tl_f,on_click=self._on_timeline_click)
+        self.timeline.pack(fill="x",padx=4,pady=(0,4))
+
+        self._switch_tab("overview")
+
+        # ─ RIGHT ────────────────────────────────────────────────
+        right=tk.Frame(body,bg=T["BG"])
+        right.grid(row=0,column=2,sticky="nsew")
+        right.rowconfigure(3,weight=1); right.columnconfigure(0,weight=1)
+
+        alf=tk.LabelFrame(right,text=" SMART ALERTS ",bg=T["PANEL"],fg=T["CYAN"],
+                           font=("Consolas",8,"bold"),bd=1,relief="flat",
+                           highlightbackground=T["BORDER"],highlightthickness=1)
+        alf.grid(row=0,column=0,sticky="ew",pady=(0,5))
+        self.alert_panel=SmartAlertPanel(alf); self.alert_panel.pack(fill="x")
+
+        self.thr_panel=ThresholdPanel(right,send_callback=self._send_cmd)
+        self.thr_panel.grid(row=1,column=0,sticky="ew",pady=(0,5))
+
+        cf2=tk.LabelFrame(right,text=" CORRELATION ENGINE ",bg=T["PANEL"],fg=T["CYAN"],
+                           font=("Consolas",8,"bold"),bd=1,relief="flat",
+                           highlightbackground=T["BORDER"],highlightthickness=1)
+        cf2.grid(row=2,column=0,sticky="ew",pady=(0,5))
+        self.corr_panel=CorrelationPanel(cf2); self.corr_panel.pack(fill="x")
+
+        pf=tk.LabelFrame(right,text=" FAILURE PREDICTION ",bg=T["PANEL"],fg=T["CYAN"],
+                          font=("Consolas",8,"bold"),bd=1,relief="flat",
+                          highlightbackground=T["BORDER"],highlightthickness=1)
+        pf.grid(row=3,column=0,sticky="nsew")
+        self.pred_lbl=tk.Label(pf,text="Gathering data…",bg=T["PANEL"],fg=T["SUBTEXT"],
+                                font=("Consolas",8),wraplength=250,justify="left",anchor="nw")
+        self.pred_lbl.pack(fill="both",expand=True,padx=8,pady=6)
+
+    # ── Tab switching ────────────────────────────────────────────
+    def _switch_tab(self,key):
+        self._active_tab.set(key)
+        for k,frame in self._tab_frames.items():
+            if k==key: frame.grid()
+            else:      frame.grid_remove()
+        for k,btn in self._tab_btns.items():
+            btn.config(bg=T["CYAN"] if k==key else T["PANEL2"],
+                       fg=T["BG"]   if k==key else T["SUBTEXT"])
+
+    # ── Theme toggle ─────────────────────────────────────────────
+    def _toggle_theme(self):
+        self._dark_mode=not self._dark_mode
+        apply_theme(DARK if self._dark_mode else LIGHT)
+        self._theme_btn.config(text="☀ LIGHT" if self._dark_mode else "🌙 DARK")
+        for w in self.winfo_children(): w.destroy()
+        self._build_ui()
+
+    # ── Quick actions ────────────────────────────────────────────
+    def _recalibrate(self):
+        self._send_cmd("RECAL")
+        messagebox.showinfo("Recalibrate","Command sent.\nKeep machine still for 2 seconds.")
+
+    def _export_csv(self):
+        if not os.path.exists(LOG_FILE):
+            messagebox.showwarning("Export","No log file found yet."); return
+        dest=filedialog.asksaveasfilename(defaultextension=".csv",
+             filetypes=[("CSV","*.csv")],
+             initialfile=f"export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        if dest: shutil.copy(LOG_FILE,dest); messagebox.showinfo("Export",f"Saved to:\n{dest}")
+
+    def _clear_log(self):
+        if messagebox.askyesno("Clear Log","Delete all log data?"):
+            try: self.log_f.close()
+            except Exception: pass
+            if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
+            self._setup_log(); messagebox.showinfo("Clear","Log cleared.")
+
+    def _on_timeline_click(self,event):
+        ts=datetime.datetime.fromtimestamp(event["time"]).strftime("%H:%M:%S")
+        messagebox.showinfo("Event",
+            f"Type:     {event['kind'].upper()}\n"
+            f"Channel:  {event['key'].upper()}\n"
+            f"Value:    {event['value']:.4g}\n"
+            f"Severity: {event.get('severity','')}\n"
+            f"Time:     {ts}")
+
+    # ── Helpers ─────────────────────────────────────────────────
+    def _set_status(self,msg,color):
+        try: self.status_lbl.config(text=msg,fg=color)
+        except Exception: pass
+
+    def _refresh_ports(self):
+        ports=[p.device for p in serial.tools.list_ports.comports()]
+        self.port_cb["values"]=ports
+        if ports: self.port_var.set(ports[0])
+
+    def _send_cmd(self,cmd):
+        if self.reader: self.reader.send_command(cmd)
+
+    def _toggle_connect(self):
+        if self.reader and self.reader.running:
+            self.reader.stop(); self.reader=None
+            self.store.connected=False
+            self.conn_btn.config(text=" CONNECT ",bg=T["CYAN"],fg=T["BG"])
+            self._set_status("◆ DISCONNECTED",T["SUBTEXT"])
+        else:
+            port=self.port_var.get()
+            if not port: return
+            self.reader=SerialReader(port,self.store,self._log_row,self._on_serial_error)
+            self.reader.start()
+            self.conn_btn.config(text=" DISCONNECT ",bg=T["RED"],fg=T["TEXT"])
+            self._set_status("◈ CONNECTING…",T["YELLOW"])
+
+    # ── Main Refresh ─────────────────────────────────────────────
+    def _refresh(self):
+        snap=self.store.get_snapshot(); now=time.time()
+
+        if self.store.connected:
+            if snap["times"]:
+                age=now-snap["times"][-1]
+                col=T["GREEN"] if age<4 else T["YELLOW"]
+                self._set_status("◆ LIVE — RECEIVING DATA",col)
+                self.sample_lbl.config(
+                    text=f"samples: {len(snap['times'])}   log → {LOG_FILE}",fg=T["SUBTEXT"])
+            else:
+                self._set_status("◈ CONNECTED — WAITING…",T["YELLOW"])
+
+        try: self.banner.update(snap["alerts"],now,snap)
+        except Exception: pass
+
+        if snap["health"]:
+            self.gauge.set_score(snap["health"][-1])
+
+        self.breakdown.update(snap["last"])
+
+        last=snap["last"]
+        if last:
+            t,h,v,a,s=last[0],last[1],last[2],last[3],last[4]
+            vals={"temp":t,"humid":h,"vibe":v,"amp":a,"sound":s}
+            for key,tile in self.tiles.items():
+                val=vals.get(key,0); thr=THRESHOLDS.get(key,100)
+                ratio=val/thr if thr else 0
+                col=T["GREEN"] if ratio<0.6 else T["YELLOW"] if ratio<0.9 else T["RED"]
+                tile.val_lbl.config(text=f"{val:.3g} {tile.unit}",fg=col)
+
+        times=snap["times"]
+        humid_ov=[{"data":snap["humid"],"color":T["BLUE"],"label":"humid","unit":"%"}]
+
+        # Overview charts
+        self.charts["ov_temp"].update_data(snap["temp"],times,THRESHOLDS["temp"],humid_ov)
+        self.charts["ov_vibe"].update_data(snap["vibe"],times,THRESHOLDS["vibe"])
+        self.charts["ov_amp"].update_data(snap["amp"],times,THRESHOLDS["amp"])
+        self.charts["ov_health"].update_data(snap["health"],times)
+
+        # Temp tab
+        self.charts["tt_temp"].update_data(snap["temp"],times,THRESHOLDS["temp"])
+        self.charts["tt_humid"].update_data(snap["humid"],times)
+
+        # Vibe tab
+        self.charts["tv_vibe"].update_data(snap["vibe"],times,THRESHOLDS["vibe"])
+
+        # Electrical tab
+        self.charts["te_amp"].update_data(snap["amp"],times,THRESHOLDS["amp"])
+
+        # Noise tab
+        self.charts["tn_sound"].update_data(snap["sound"],times,THRESHOLDS["sound"])
+
+        self.thr_panel.update_proximity(last)
+        self.alert_panel.update(snap["alerts"],now)
+        self.corr_panel.update(snap)
+        self.timeline.update_events(snap.get("events",[]))
+
+        pred=PredictionEngine.analyze(snap)
+        if pred:
+            lines=[]
+            slope=pred["health_slope"]
+            if slope<-0.1:   lines.append(f"⬇ Declining {abs(slope)*60:.1f} pts/min")
+            elif slope>0.05: lines.append("⬆ Health improving")
+            else:            lines.append("✓ Stable")
+            for ch,mins,sl,r2,conf in pred["predictions"]:
+                lines.append(f"▲ {ch} threshold in ~{mins:.1f} min [{conf}]")
+            if not pred["predictions"] and slope>=-0.1:
+                lines.append("All parameters safe.")
+            self.pred_lbl.config(text="\n".join(lines),fg=T["TEXT"])
+
+        self.after(500,self._refresh)
+
+    def destroy(self):
+        if self.reader: self.reader.stop()
+        try: self.log_f.close()
+        except Exception: pass
+        super().destroy()
+
+
+# ══════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()   
